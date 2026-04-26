@@ -118,15 +118,19 @@
             <el-input
               v-model="settings.proxyUrl"
               placeholder="http://127.0.0.1:7890"
-              style="width: 280px;"
+              style="width: 320px;"
               clearable
             >
               <template #prefix>
                 <el-icon><Connection /></el-icon>
               </template>
             </el-input>
-            <div style="margin-top: 5px; color: #909399; font-size: 12px;">
-              支持 HTTP/HTTPS/SOCKS5 代理，格式：http://host:port 或 socks5://host:port
+            <div style="margin-top: 5px; color: #909399; font-size: 12px; line-height: 1.6;">
+              支持 HTTP/HTTPS/SOCKS5 代理，可用以下任意格式（不带协议时默认 http）：<br>
+              · <code>http://host:port</code> / <code>socks5://host:port</code><br>
+              · <code>host:port</code><br>
+              · <code>user:pass@host:port</code> / <code>host:port@user:pass</code><br>
+              · <code>host:port:user:pass</code> / <code>user:pass:host:port</code>
             </div>
           </el-form-item>
           

@@ -1645,7 +1645,8 @@ async function handleTurnstileSuccess(turnstileToken: string) {
         startTrial,
         teamName,
         teamTiers.includes(teamsTier) ? seatCount : undefined, // 团队/企业类计划需要席位
-        turnstileToken || undefined // trial 签约时所有计划均需 Turnstile token
+        turnstileToken || undefined, // trial 签约时所有计划均需 Turnstile token
+        account.id // 传入账号 ID 以便后端构造完整的 AuthContext（支持 Devin 5-header）
       );
       
       if (result.success && result.window_opened) {

@@ -929,6 +929,13 @@ pub async fn close_payment_window(app: AppHandle) -> Result<(), String> {
 }
 
 /// 获取试用绑卡链接并可选地在内置浏览器中打开（增强版）
+///
+/// `account_id` 为可选参数：
+/// - 提供时：从账号库查出账号并通过 `AuthContext::from_account` 构造完整鉴权上下文，
+///   Devin 账号会自动附带 `x-devin-session-token` / `x-devin-account-id` /
+///   `x-devin-auth1-token` / `x-devin-primary-org-id` 等扩展 header，
+///   修复"Devin 账号获取支付链接老是失败"的问题
+/// - 缺省时：兜底沿用旧的 Firebase-only 行为（仅写 `x-auth-token`），保留向前兼容
 #[command]
 pub async fn get_trial_payment_link_enhanced(
     app: AppHandle,
@@ -942,12 +949,64 @@ pub async fn get_trial_payment_link_enhanced(
     team_name: Option<String>,
     seat_count: Option<i32>,
     turnstile_token: Option<String>,
+    account_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
     // 获取WindsurfService实例
     let service = crate::services::windsurf_service::WindsurfService::new();
 
-    // 前端传入的 token 是 Firebase idToken（Devin 账号走独立的前端入口），这里构造 Firebase AuthContext
-    let ctx = crate::services::AuthContext::firebase(token.clone());
+    // 优先按 account_id 加载账号并构造统一鉴权上下文（支持 Devin 5-header）
+    // 仅当 account_id 缺失或加载失败时，才回退到"裸 Firebase token"形态
+    let ctx = match account_id.as_deref() {
+        Some(id_str) => match Uuid::parse_str(id_str) {
+            Ok(uuid) => match data_store.get_account(uuid).await {
+                Ok(mut account) => {
+                    // 与 get_trial_payment_link 保持一致：先确保 token 有效
+                    if let Err(e) =
+                        crate::commands::api_commands::ensure_valid_token(
+                            &data_store, &mut account, uuid,
+                        )
+                        .await
+                    {
+                        println!(
+                            "[PaymentLinkEnhanced] ensure_valid_token failed for {}: {}",
+                            id_str, e
+                        );
+                    }
+                    match crate::services::AuthContext::from_account(&account) {
+                        Ok(ctx) => {
+                            println!(
+                                "[PaymentLinkEnhanced] using AuthContext::from_account (is_devin={})",
+                                ctx.is_devin()
+                            );
+                            ctx
+                        }
+                        Err(e) => {
+                            println!(
+                                "[PaymentLinkEnhanced] AuthContext::from_account failed: {}, fallback to firebase ctx",
+                                e
+                            );
+                            crate::services::AuthContext::firebase(token.clone())
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!(
+                        "[PaymentLinkEnhanced] account lookup failed for {}: {}, fallback to firebase ctx",
+                        id_str, e
+                    );
+                    crate::services::AuthContext::firebase(token.clone())
+                }
+            },
+            Err(e) => {
+                println!(
+                    "[PaymentLinkEnhanced] invalid account_id '{}': {}, fallback to firebase ctx",
+                    id_str, e
+                );
+                crate::services::AuthContext::firebase(token.clone())
+            }
+        },
+        None => crate::services::AuthContext::firebase(token.clone()),
+    };
 
     // 调用subscribe_to_plan方法获取支付链接
     let result = service.subscribe_to_plan(
