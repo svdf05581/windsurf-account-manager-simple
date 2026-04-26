@@ -560,6 +560,151 @@ pub async fn switch_account(
     }))
 }
 
+/// 根据 client_type 推导 Windsurf 进程名（Windows 上带 .exe，类 Unix 上去 .exe）
+fn windsurf_process_name(client_type: &str) -> &'static str {
+    match client_type {
+        "windsurf-next" => "Windsurf - Next.exe",
+        _ => "Windsurf.exe",
+    }
+}
+
+/// 检测 Windsurf / Windsurf - Next 进程是否在运行（用于重置机器 ID 前先结束进程）
+fn is_windsurf_running(process_name: &str) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        use std::process::Command;
+        let output = Command::new("tasklist")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args([
+                "/FI",
+                &format!("IMAGENAME eq {}", process_name),
+                "/NH",
+                "/FO",
+                "CSV",
+            ])
+            .output();
+        match output {
+            Ok(out) => String::from_utf8_lossy(&out.stdout).contains(process_name),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::process::Command;
+        let clean = process_name.trim_end_matches(".exe");
+        match Command::new("pgrep").args(["-f", clean]).output() {
+            Ok(out) => !out.stdout.is_empty(),
+            Err(_) => false,
+        }
+    }
+}
+
+/// 强制结束 Windsurf / Windsurf - Next 进程，避免 state.vscdb / storage.json 被锁
+fn kill_windsurf(process_name: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        use std::process::Command;
+        let _ = Command::new("taskkill")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args(["/F", "/IM", process_name])
+            .output();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::process::Command;
+        let clean = process_name.trim_end_matches(".exe");
+        let _ = Command::new("pkill").args(["-f", clean]).output();
+    }
+    // 给系统留出释放文件句柄的时间
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+}
+
+/// 更新 `%APPDATA%\Windsurf\User\globalStorage\state.vscdb` 里的 `codeium.installationId`。
+///
+/// Windsurf 后端"too many free user accounts for this device"判定以 `codeium.installationId`
+/// 为 primary key，仅重写 `storage.json` 里的 telemetry ID 和注册表 `MachineGuid` 是不够的，
+/// 必须把这条指纹一起换新，否则切号还会被后端以同设备为由拒绝登录。
+///
+/// 字段结构参考（逆向自 account-switch-demo/README.md）：
+/// ```json
+/// {
+///   "codeium.installationId": "<uuid>",
+///   "apiServerUrl": "https://server.self-serve.windsurf.com",
+///   "codeium.hasOneTimeUpdatedUnspecifiedMode": true
+/// }
+/// ```
+fn reset_state_vscdb_installation_id(state_db_path: &std::path::Path) -> AppResult<Option<String>> {
+    if !state_db_path.exists() {
+        info!(
+            "state.vscdb not found at {:?}, skipping installationId reset",
+            state_db_path
+        );
+        return Ok(None);
+    }
+
+    let connection = rusqlite::Connection::open(state_db_path).map_err(|e| {
+        AppError::Database(format!(
+            "打开 state.vscdb 失败（可能 Windsurf 仍在运行占用文件）: {}. 路径: {:?}",
+            e, state_db_path
+        ))
+    })?;
+
+    // 处理 "database is locked"：最多等 3 秒
+    let _ = connection.busy_timeout(std::time::Duration::from_secs(3));
+
+    let raw_value: Option<String> = connection
+        .query_row(
+            "SELECT value FROM ItemTable WHERE key = 'codeium.windsurf'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let new_installation_id = Uuid::new_v4().to_string().to_lowercase();
+
+    let new_value = match raw_value {
+        Some(existing) => {
+            let mut parsed: Value = serde_json::from_str(&existing).unwrap_or_else(|e| {
+                warn!(
+                    "codeium.windsurf value 不是合法 JSON，整体改写: {}",
+                    e
+                );
+                json!({})
+            });
+            parsed["codeium.installationId"] = json!(new_installation_id);
+            parsed.to_string()
+        }
+        None => {
+            // key 不存在时，按官方格式补一份最小结构
+            json!({
+                "codeium.installationId": new_installation_id,
+            })
+            .to_string()
+        }
+    };
+
+    connection
+        .execute(
+            "INSERT INTO ItemTable (key, value) VALUES ('codeium.windsurf', ?1) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [&new_value],
+        )
+        .map_err(|e| {
+            AppError::Database(format!(
+                "写入 state.vscdb 失败: {}. 请确保 Windsurf 已完全关闭再重试",
+                e
+            ))
+        })?;
+
+    info!(
+        "Updated codeium.installationId in {:?} to: {}",
+        state_db_path, new_installation_id
+    );
+    Ok(Some(new_installation_id))
+}
+
 /// 内部重置机器ID函数
 async fn reset_machine_id_internal(client_type: &str) -> AppResult<()> {
     use std::fs;
@@ -581,6 +726,16 @@ async fn reset_machine_id_internal(client_type: &str) -> AppResult<()> {
     // devDeviceId: 标准UUID格式
     let new_device_id = Uuid::new_v4().to_string().to_lowercase();
     
+    // Step 0: Windsurf 运行中会锁住 storage.json / state.vscdb，先优雅结束掉
+    let process_name = windsurf_process_name(client_type);
+    if is_windsurf_running(process_name) {
+        info!(
+            "Detected running {}, killing it before resetting machine ID",
+            process_name
+        );
+        kill_windsurf(process_name);
+    }
+
     // 更新storage.json
     let (_, data_dir_name) = get_client_uri_config(client_type);
     let mut storage_path = directories::BaseDirs::new()
@@ -593,7 +748,11 @@ async fn reset_machine_id_internal(client_type: &str) -> AppResult<()> {
     
     if storage_path.exists() {
         let content = fs::read_to_string(&storage_path)
-            .map_err(|e| AppError::FileOperation(format!("Failed to read storage.json: {}", e)))?;
+            .map_err(|e| AppError::FileOperation(format!(
+                "读取 storage.json 失败: {} (os error {:?})",
+                e,
+                e.raw_os_error()
+            )))?;
         let mut storage: Value = serde_json::from_str(&content)
             .map_err(AppError::Serialization)?;
         
@@ -601,15 +760,51 @@ async fn reset_machine_id_internal(client_type: &str) -> AppResult<()> {
         storage["telemetry.macMachineId"] = json!(new_mac_machine_id);
         storage["telemetry.sqmId"] = json!(new_sqm_id);
         storage["telemetry.devDeviceId"] = json!(new_device_id);
+        // 清掉 firstSession/lastSession 日期，降低 Windsurf 后端"老设备"嫌疑
+        if let Some(obj) = storage.as_object_mut() {
+            obj.remove("telemetry.firstSessionDate");
+            obj.remove("telemetry.lastSessionDate");
+            obj.remove("telemetry.currentSessionDate");
+        }
         
         let updated = serde_json::to_string_pretty(&storage)
             .map_err(AppError::Serialization)?;
         fs::write(&storage_path, updated)
-            .map_err(|e| AppError::FileOperation(format!("Failed to write storage.json: {}. 可能需要管理员权限", e)))?;
+            .map_err(|e| {
+                let os = e.raw_os_error();
+                let hint = match os {
+                    Some(32) => "文件被占用：请先完全退出 Windsurf（含托盘进程）",
+                    Some(5) => "权限不足：请右键以管理员身份运行账号管理器",
+                    _ => "请确认 Windsurf 已关闭 & 账号管理器有写入权限",
+                };
+                AppError::FileOperation(format!(
+                    "写入 storage.json 失败: {} (os error {:?})。{}",
+                    e, os, hint
+                ))
+            })?;
         
         info!("Updated storage.json with new machine IDs");
     } else {
         warn!("storage.json not found at {:?}", storage_path);
+    }
+
+    // 更新 state.vscdb 里的 codeium.installationId（Windsurf 后端主要看的指纹）
+    let mut state_db_path = directories::BaseDirs::new()
+        .map(|dirs| dirs.data_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("C:/Users/Default/AppData/Roaming"));
+    state_db_path.push(data_dir_name);
+    state_db_path.push("User");
+    state_db_path.push("globalStorage");
+    state_db_path.push("state.vscdb");
+    match reset_state_vscdb_installation_id(&state_db_path) {
+        Ok(Some(new_id)) => info!("codeium.installationId reset 成功: {}", new_id),
+        Ok(None) => info!("state.vscdb 未找到，跳过 installationId 重置"),
+        Err(e) => {
+            // state.vscdb 写失败不阻断剩余步骤（注册表 MachineGuid 仍然有价值），
+            // 但必须把错误往外抛让用户看到
+            warn!("Failed to reset codeium.installationId: {:?}", e);
+            return Err(e);
+        }
     }
     
     // Windows特定：更新注册表（程序启动时已要求管理员权限）
@@ -754,14 +949,31 @@ pub async fn reset_machine_id(
         Ok(s) => s.windsurf_client_type,
         Err(_) => "windsurf".to_string(),
     };
+
+    // 事前做一次管理员权限预检，帮用户提前识别出"注册表写失败"的真正原因
+    #[cfg(target_os = "windows")]
+    let admin_hint = if !is_elevated() {
+        Some("未检测到管理员权限：若重置注册表 MachineGuid 失败，请关闭程序后右键→以管理员身份运行")
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "windows"))]
+    let admin_hint: Option<&str> = None;
+
     match reset_machine_id_internal(&client_type).await {
         Ok(()) => Ok(json!({
             "success": true,
-            "message": "机器ID重置成功"
+            "message": match admin_hint {
+                Some(hint) => format!("机器ID重置成功。提示：{}", hint),
+                None => "机器ID重置成功".to_string(),
+            }
         })),
         Err(e) => Ok(json!({
             "success": false,
-            "message": format!("机器ID重置失败: {}", e)
+            "message": match admin_hint {
+                Some(hint) => format!("机器ID重置失败: {}\n{}", e, hint),
+                None => format!("机器ID重置失败: {}", e),
+            }
         }))
     }
 }
