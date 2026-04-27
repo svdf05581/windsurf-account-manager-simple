@@ -490,7 +490,11 @@ pub async fn switch_account(
     // Step 3: 尝试重置机器ID（可能需要管理员权限）
     info!("Attempting to reset machine ID...");
     emit_switch_progress(&app, "reset_mid", "重置机器 ID...", 70, "running");
-    let reset_result = reset_machine_id_internal(&client_type).await;
+    // 切号流程内**不能杀** Windsurf——后面 trigger_windsurf_callback 还需要它在线
+    // 接收 windsurf://...#access_token=... 这条 deep link，杀了就等于切号失败。
+    // 所以这里传 kill_running_process=false，state.vscdb / storage.json 写不进去（被锁）
+    // 只 warn 不 abort，保住切号主路径。
+    let reset_result = reset_machine_id_internal(&client_type, false).await;
     let machine_id_reset = match reset_result {
         Ok(_) => {
             info!("Machine ID reset successful");
@@ -706,7 +710,15 @@ fn reset_state_vscdb_installation_id(state_db_path: &std::path::Path) -> AppResu
 }
 
 /// 内部重置机器ID函数
-async fn reset_machine_id_internal(client_type: &str) -> AppResult<()> {
+///
+/// `kill_running_process` 控制是否在重置前主动结束 Windsurf 进程：
+/// - `true`（用户主动点"重置机器 ID"按钮）：杀掉 Windsurf 以避免 storage.json /
+///   state.vscdb 被锁，所有写失败都按错误抛出。
+/// - `false`（"一键换号"流程内调用）：**不能杀** Windsurf，否则随后的
+///   `windsurf://...#access_token=...` deep link 没有 URI handler 接收，切号会失败。
+///   此时所有可能因文件被锁或权限问题失败的写入都按 best-effort 处理（warn 后继续），
+///   不阻断切号主流程。
+async fn reset_machine_id_internal(client_type: &str, kill_running_process: bool) -> AppResult<()> {
     use std::fs;
     use rand::Rng;
     
@@ -726,14 +738,21 @@ async fn reset_machine_id_internal(client_type: &str) -> AppResult<()> {
     // devDeviceId: 标准UUID格式
     let new_device_id = Uuid::new_v4().to_string().to_lowercase();
     
-    // Step 0: Windsurf 运行中会锁住 storage.json / state.vscdb，先优雅结束掉
+    // Step 0: Windsurf 运行中会锁住 storage.json / state.vscdb；
+    // 但只有用户**主动点重置按钮**才允许杀进程——切号流程里千万不能杀，
+    // 否则后续 deep link 没法被接收 → 看起来"账号不登录、不换号"。
     let process_name = windsurf_process_name(client_type);
-    if is_windsurf_running(process_name) {
+    if kill_running_process && is_windsurf_running(process_name) {
         info!(
             "Detected running {}, killing it before resetting machine ID",
             process_name
         );
         kill_windsurf(process_name);
+    } else if !kill_running_process && is_windsurf_running(process_name) {
+        warn!(
+            "{} 正在运行，本次只对未锁定的字段做 best-effort 重置；要彻底重置 installationId 请先关闭 Windsurf 再单独点击\"重置机器 ID\"",
+            process_name
+        );
     }
 
     // 更新storage.json
@@ -747,43 +766,56 @@ async fn reset_machine_id_internal(client_type: &str) -> AppResult<()> {
     storage_path.push("storage.json");
     
     if storage_path.exists() {
-        let content = fs::read_to_string(&storage_path)
-            .map_err(|e| AppError::FileOperation(format!(
-                "读取 storage.json 失败: {} (os error {:?})",
-                e,
-                e.raw_os_error()
-            )))?;
-        let mut storage: Value = serde_json::from_str(&content)
-            .map_err(AppError::Serialization)?;
-        
-        storage["telemetry.machineId"] = json!(new_machine_id);
-        storage["telemetry.macMachineId"] = json!(new_mac_machine_id);
-        storage["telemetry.sqmId"] = json!(new_sqm_id);
-        storage["telemetry.devDeviceId"] = json!(new_device_id);
-        // 清掉 firstSession/lastSession 日期，降低 Windsurf 后端"老设备"嫌疑
-        if let Some(obj) = storage.as_object_mut() {
-            obj.remove("telemetry.firstSessionDate");
-            obj.remove("telemetry.lastSessionDate");
-            obj.remove("telemetry.currentSessionDate");
+        let storage_write_result: AppResult<()> = (|| {
+            let content = fs::read_to_string(&storage_path)
+                .map_err(|e| AppError::FileOperation(format!(
+                    "读取 storage.json 失败: {} (os error {:?})",
+                    e,
+                    e.raw_os_error()
+                )))?;
+            let mut storage: Value = serde_json::from_str(&content)
+                .map_err(AppError::Serialization)?;
+
+            storage["telemetry.machineId"] = json!(new_machine_id);
+            storage["telemetry.macMachineId"] = json!(new_mac_machine_id);
+            storage["telemetry.sqmId"] = json!(new_sqm_id);
+            storage["telemetry.devDeviceId"] = json!(new_device_id);
+            // 清掉 firstSession/lastSession 日期，降低 Windsurf 后端"老设备"嫌疑
+            if let Some(obj) = storage.as_object_mut() {
+                obj.remove("telemetry.firstSessionDate");
+                obj.remove("telemetry.lastSessionDate");
+                obj.remove("telemetry.currentSessionDate");
+            }
+
+            let updated = serde_json::to_string_pretty(&storage)
+                .map_err(AppError::Serialization)?;
+            fs::write(&storage_path, updated)
+                .map_err(|e| {
+                    let os = e.raw_os_error();
+                    let hint = match os {
+                        Some(32) => "文件被占用：请先完全退出 Windsurf（含托盘进程）",
+                        Some(5) => "权限不足：请右键以管理员身份运行账号管理器",
+                        _ => "请确认 Windsurf 已关闭 & 账号管理器有写入权限",
+                    };
+                    AppError::FileOperation(format!(
+                        "写入 storage.json 失败: {} (os error {:?})。{}",
+                        e, os, hint
+                    ))
+                })?;
+
+            info!("Updated storage.json with new machine IDs");
+            Ok(())
+        })();
+
+        if let Err(e) = storage_write_result {
+            if kill_running_process {
+                // 用户主动点重置：写失败必须显式报错
+                return Err(e);
+            } else {
+                // 切号 best-effort：写不进去不阻断流程
+                warn!("(best-effort) storage.json 重置跳过: {:?}", e);
+            }
         }
-        
-        let updated = serde_json::to_string_pretty(&storage)
-            .map_err(AppError::Serialization)?;
-        fs::write(&storage_path, updated)
-            .map_err(|e| {
-                let os = e.raw_os_error();
-                let hint = match os {
-                    Some(32) => "文件被占用：请先完全退出 Windsurf（含托盘进程）",
-                    Some(5) => "权限不足：请右键以管理员身份运行账号管理器",
-                    _ => "请确认 Windsurf 已关闭 & 账号管理器有写入权限",
-                };
-                AppError::FileOperation(format!(
-                    "写入 storage.json 失败: {} (os error {:?})。{}",
-                    e, os, hint
-                ))
-            })?;
-        
-        info!("Updated storage.json with new machine IDs");
     } else {
         warn!("storage.json not found at {:?}", storage_path);
     }
@@ -800,10 +832,15 @@ async fn reset_machine_id_internal(client_type: &str) -> AppResult<()> {
         Ok(Some(new_id)) => info!("codeium.installationId reset 成功: {}", new_id),
         Ok(None) => info!("state.vscdb 未找到，跳过 installationId 重置"),
         Err(e) => {
-            // state.vscdb 写失败不阻断剩余步骤（注册表 MachineGuid 仍然有价值），
-            // 但必须把错误往外抛让用户看到
             warn!("Failed to reset codeium.installationId: {:?}", e);
-            return Err(e);
+            if kill_running_process {
+                // 用户主动点重置：state.vscdb 写失败必须报错让用户知情
+                return Err(e);
+            } else {
+                // 切号 best-effort：state.vscdb 通常被运行中的 Windsurf 锁住，
+                // 这里写不进去是正常的；不能阻断后面的 deep link 切号步骤
+                warn!("(best-effort) installationId 未能在切号同步重置（Windsurf 运行中锁库属正常），如需彻底重置请先关闭 Windsurf 再点\"重置机器 ID\"");
+            }
         }
     }
     
@@ -960,7 +997,9 @@ pub async fn reset_machine_id(
     #[cfg(not(target_os = "windows"))]
     let admin_hint: Option<&str> = None;
 
-    match reset_machine_id_internal(&client_type).await {
+    // 用户主动点"重置机器 ID"按钮 → 允许杀 Windsurf 以便能成功改 state.vscdb /
+    // storage.json，重置后用户自己再启动 Windsurf 切号即可。
+    match reset_machine_id_internal(&client_type, true).await {
         Ok(()) => Ok(json!({
             "success": true,
             "message": match admin_hint {
