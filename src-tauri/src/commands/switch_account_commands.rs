@@ -1161,8 +1161,17 @@ async fn inject_account_via_safe_storage(
 ) -> AppResult<()> {
     use crate::utils::electron_safe_storage::{encode_buffer_json, encrypt_v10, get_windows_master_key};
 
+    info!("[Inject][1/8] 进入加密注入流程: client={} account={} email={}",
+        client_type, account.id, account.email);
+
     // 1) 解析 apiKey + 用户标识（用于 sessions.account.label / windsurfAuthStatus.name）
     let api_key = resolve_inject_api_key(account)?;
+    info!(
+        "[Inject][2/8] apiKey 解析成功: kind={} length={} prefix={}",
+        if account.is_devin_account() { "devin-session-token" } else { "windsurf_api_key" },
+        api_key.len(),
+        if api_key.len() >= 8 { &api_key[..8] } else { "<short>" },
+    );
     let api_server_url = WINDSURF_DEFAULT_API_SERVER_URL.to_string();
     let label = if !account.nickname.is_empty() {
         account.nickname.clone()
@@ -1173,14 +1182,19 @@ async fn inject_account_via_safe_storage(
     // 2) 杀掉 Windsurf 进程（写 state.vscdb 必须独占文件）
     let process_name = windsurf_process_name(client_type);
     if is_windsurf_running(process_name) {
-        info!("Detected running {}, killing it before safe-storage injection", process_name);
+        info!("[Inject][3/8] 检测到 {} 进程在跑，taskkill 中…", process_name);
         kill_windsurf(process_name);
+        info!("[Inject][3/8] {} 已结束（含 1.2s 句柄释放等待）", process_name);
+    } else {
+        info!("[Inject][3/8] {} 进程未运行，跳过 kill", process_name);
     }
 
     // 3) 同步重置 storage.json + codeium.installationId（reset_machine_id_internal kill=true 路径）
+    info!("[Inject][4/8] 重置机器 ID（storage.json + state.vscdb installationId + 注册表 MachineGuid）…");
     if let Err(e) = reset_machine_id_internal(client_type, true).await {
-        warn!("Reset machine ID failed during safe-storage inject: {:?}", e);
-        // 不阻断：注入本身和 reset 解耦，reset 失败仍可继续注入
+        warn!("[Inject][4/8] reset_machine_id_internal 报错（继续注入，best-effort）: {:?}", e);
+    } else {
+        info!("[Inject][4/8] 机器 ID 重置完成");
     }
 
     // 4) 拼出 state.vscdb 路径
@@ -1189,6 +1203,7 @@ async fn inject_account_via_safe_storage(
     state_db_path.push("User");
     state_db_path.push("globalStorage");
     state_db_path.push("state.vscdb");
+    info!("[Inject][5/8] state.vscdb 路径: {}", state_db_path.display());
     if !state_db_path.exists() {
         return Err(AppError::FileOperation(format!(
             "state.vscdb 不存在: {:?}\n请先启动一次 Windsurf 让它生成本地存储",
@@ -1197,11 +1212,17 @@ async fn inject_account_via_safe_storage(
     }
 
     // 5) 取出 Electron os_crypt master key
+    info!("[Inject][6/8] 调用 DPAPI 解密 Local State.os_crypt.encrypted_key …");
     let master_key = get_windows_master_key(&data_root)?;
+    info!(
+        "[Inject][6/8] DPAPI 解出 master key: {} bytes (期望 32)",
+        master_key.len()
+    );
 
     // 6) 构造并加密 sessions / apiServerUrl
+    let session_id = Uuid::new_v4().to_string();
     let sessions_payload = json!([{
-        "id": Uuid::new_v4().to_string(),
+        "id": session_id,
         "accessToken": api_key,
         "account": {
             "label": label,
@@ -1210,10 +1231,22 @@ async fn inject_account_via_safe_storage(
         "scopes": [],
     }]);
     let sessions_plain = sessions_payload.to_string();
+    info!(
+        "[Inject][7/8] 加密 sessions：明文 {} bytes / session_id={} / label={}",
+        sessions_plain.len(), session_id, label
+    );
     let sessions_encrypted = encrypt_v10(&master_key, sessions_plain.as_bytes())?;
+    info!(
+        "[Inject][7/8] AES-256-GCM 加密完成 sessions：密文 {} bytes (含 v10 prefix + 12B nonce + tag)",
+        sessions_encrypted.len()
+    );
     let sessions_buffer_json = encode_buffer_json(&sessions_encrypted);
 
     let api_server_encrypted = encrypt_v10(&master_key, api_server_url.as_bytes())?;
+    info!(
+        "[Inject][7/8] AES-256-GCM 加密完成 apiServerUrl：明文 {} bytes -> 密文 {} bytes",
+        api_server_url.len(), api_server_encrypted.len()
+    );
     let api_server_buffer_json = encode_buffer_json(&api_server_encrypted);
 
     // 7) 构造明文 windsurfAuthStatus + codeium.windsurf
@@ -1226,6 +1259,7 @@ async fn inject_account_via_safe_storage(
     .to_string();
 
     // 8) 一次事务写入四个 key
+    info!("[Inject][8/8] 打开 SQLite 连接 → state.vscdb …");
     let conn = rusqlite::Connection::open(&state_db_path)
         .map_err(|e| AppError::Database(format!("打开 state.vscdb 失败: {}", e)))?;
     let _ = conn.busy_timeout(std::time::Duration::from_secs(3));
@@ -1233,12 +1267,20 @@ async fn inject_account_via_safe_storage(
     let upsert_sql = "INSERT INTO ItemTable (key, value) VALUES (?1, ?2) \
                       ON CONFLICT(key) DO UPDATE SET value = excluded.value";
 
-    conn.execute(upsert_sql, (WINDSURF_AUTH_STATUS_KEY, &auth_status_plain))
+    let n = conn.execute(upsert_sql, (WINDSURF_AUTH_STATUS_KEY, &auth_status_plain))
         .map_err(|e| AppError::Database(format!("写入 windsurfAuthStatus 失败: {}", e)))?;
-    conn.execute(upsert_sql, (WINDSURF_SESSIONS_SECRET_KEY, &sessions_buffer_json))
+    info!("[Inject][8/8] UPSERT windsurfAuthStatus 完成 (rows={}, value={} bytes)",
+        n, auth_status_plain.len());
+
+    let n = conn.execute(upsert_sql, (WINDSURF_SESSIONS_SECRET_KEY, &sessions_buffer_json))
         .map_err(|e| AppError::Database(format!("写入 windsurf_auth.sessions 失败: {}", e)))?;
-    conn.execute(upsert_sql, (WINDSURF_API_SERVER_SECRET_KEY, &api_server_buffer_json))
+    info!("[Inject][8/8] UPSERT windsurf_auth.sessions 完成 (rows={}, value={} bytes)",
+        n, sessions_buffer_json.len());
+
+    let n = conn.execute(upsert_sql, (WINDSURF_API_SERVER_SECRET_KEY, &api_server_buffer_json))
         .map_err(|e| AppError::Database(format!("写入 windsurf_auth.apiServerUrl 失败: {}", e)))?;
+    info!("[Inject][8/8] UPSERT windsurf_auth.apiServerUrl 完成 (rows={}, value={} bytes)",
+        n, api_server_buffer_json.len());
 
     // codeium.windsurf 是个明文 JSON，原本含 codeium.installationId（reset_machine_id 已经更新过），
     // 这里把 apiServerUrl 也补上（cockpit-tools 的做法），让 Windsurf 启动时直接读到正确 server。

@@ -11,7 +11,9 @@ use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    env_logger::init();
+    init_logger();
+    log::info!("=== windsurf-account-manager started (log level=info) ===");
+
     
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -66,6 +68,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            // 日志命令
+            get_log_file_path,
             // 账号管理命令
             commands::add_account,
             commands::add_account_by_refresh_token,
@@ -267,4 +271,109 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// 初始化日志：默认 info 级别 + 同时写到 stderr 与 `<UserData>/windsurf-account-manager/app.log`。
+///
+/// 由于 release 构建走 `windows_subsystem = "windows"`，stderr 被分离，单纯的 env_logger
+/// 在 GUI 下"日志看不见"。这里同时写文件，用户可通过日志面板的"打开日志文件夹"按钮直接打开。
+/// 文件按 5MB 简单滚动（写满后归档为 app.log.1，再开新 app.log），最多保留 3 份历史。
+fn init_logger() {
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    struct DualWriter {
+        stderr: std::io::Stderr,
+        file: Mutex<Option<std::fs::File>>,
+    }
+    impl Write for DualWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let _ = self.stderr.write_all(buf);
+            if let Ok(mut guard) = self.file.lock() {
+                if let Some(f) = guard.as_mut() {
+                    let _ = f.write_all(buf);
+                }
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            let _ = self.stderr.flush();
+            if let Ok(mut guard) = self.file.lock() {
+                if let Some(f) = guard.as_mut() {
+                    let _ = f.flush();
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let log_file_path = log_file_path();
+    let file = log_file_path.as_ref().and_then(|p| {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        rotate_log_if_needed(p);
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+            .ok()
+    });
+
+    let dual = DualWriter {
+        stderr: std::io::stderr(),
+        file: Mutex::new(file),
+    };
+
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(
+            "info,hyper=warn,reqwest=warn,rustls=warn,h2=warn,tower=warn,tao=warn,wry=warn",
+        ),
+    )
+    .format_timestamp_millis()
+    .target(env_logger::Target::Pipe(Box::new(dual)))
+    .init();
+
+    if let Some(p) = log_file_path {
+        log::info!("Log file: {}", p.display());
+    }
+}
+
+/// 返回日志文件路径：`<UserData>/windsurf-account-manager/app.log`
+fn log_file_path() -> Option<std::path::PathBuf> {
+    directories::BaseDirs::new().map(|dirs| {
+        let mut p = dirs.data_dir().to_path_buf();
+        p.push("windsurf-account-manager");
+        p.push("app.log");
+        p
+    })
+}
+
+/// 简易文件滚动：app.log > 5MB 时改名为 app.log.1，最多保留 .1 / .2 / .3 三份历史
+fn rotate_log_if_needed(p: &std::path::Path) {
+    const MAX_SIZE: u64 = 5 * 1024 * 1024;
+    let size = match std::fs::metadata(p) {
+        Ok(m) => m.len(),
+        Err(_) => return,
+    };
+    if size < MAX_SIZE {
+        return;
+    }
+    let with_ext = |n: u32| {
+        let mut owned = p.to_path_buf();
+        owned.set_extension(format!("log.{}", n));
+        owned
+    };
+    let _ = std::fs::remove_file(with_ext(3));
+    let _ = std::fs::rename(with_ext(2), with_ext(3));
+    let _ = std::fs::rename(with_ext(1), with_ext(2));
+    let mut log_1 = p.to_path_buf();
+    log_1.set_extension("log.1");
+    let _ = std::fs::rename(p, &log_1);
+}
+
+/// 暴露给前端的命令：返回当前日志文件路径
+#[tauri::command]
+fn get_log_file_path() -> Option<String> {
+    log_file_path().map(|p| p.to_string_lossy().to_string())
 }
