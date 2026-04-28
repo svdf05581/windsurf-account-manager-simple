@@ -71,16 +71,30 @@ fn create_google_api_client(proxy_url: Option<&str>) -> reqwest::Client {
         .redirect(reqwest::redirect::Policy::limited(5))
         .http1_only();
     
-    // 如果提供了代理地址，配置代理
+    // 如果提供了代理地址，先做格式归一化再配置代理
+    // 兼容第三方代理常见的几种格式：
+    //   host:port、user:pass@host:port、host:port@user:pass、
+    //   host:port:user:pass、user:pass:host:port、以及标准 URL
     if let Some(url) = proxy_url {
         if !url.is_empty() {
-            match reqwest::Proxy::all(url) {
-                Ok(proxy) => {
-                    println!("[Google API Client] Using proxy: {}", url);
-                    builder = builder.proxy(proxy);
-                }
+            match crate::utils::normalize_proxy_url(url) {
+                Ok(normalized) => match reqwest::Proxy::all(&normalized) {
+                    Ok(proxy) => {
+                        println!("[Google API Client] Using proxy: {}", normalized);
+                        builder = builder.proxy(proxy);
+                    }
+                    Err(e) => {
+                        println!(
+                            "[Google API Client] Failed to build proxy from '{}': {}",
+                            normalized, e
+                        );
+                    }
+                },
                 Err(e) => {
-                    println!("[Google API Client] Failed to parse proxy URL: {}", e);
+                    println!(
+                        "[Google API Client] Failed to normalize proxy URL '{}': {}",
+                        url, e
+                    );
                 }
             }
         }

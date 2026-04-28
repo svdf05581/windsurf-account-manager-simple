@@ -1,6 +1,6 @@
 [package]
 name = "windsurf-account-manager"
-version = "1.7.6"
+version = "1.7.8"
 description = "Windsurf Account Manager - Simple"
 authors = ["chaogei666"]
 license = "AGPL-3.0"
@@ -50,7 +50,7 @@ zip = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
-winapi = { version = "0.3", features = ["securitybaseapi", "processthreadsapi", "winnt", "handleapi", "minwindef", "shellapi", "winuser"] }
+winapi = { version = "0.3", features = ["securitybaseapi", "processthreadsapi", "winnt", "handleapi", "minwindef", "shellapi", "winuser", "wincrypt", "dpapi", "winbase"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

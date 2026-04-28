@@ -239,10 +239,12 @@ pub struct DevinAuthService {
 
 impl DevinAuthService {
     pub fn new() -> Self {
-        // Devin Auth 走 windsurf.com 同源代理，**不**经过 Google API Client
-        // 所以这里使用全局普通 HTTP Client（支持用户代理配置但无 Google 限制）
+        // Devin 邮箱注册 / 验证码登录 / WindsurfPostAuth 桥接在国内网络下
+        // 经常需要走代理才能访问 windsurf.com 与 web-backend.windsurf.com，
+        // 因此复用支持代理的 client（启用代理时统一走代理，未启用时与全局 client 行为一致）。
+        // 同时配套修复了 Devin 账号一键刷新 session_token / 邮箱注册老超时的问题。
         Self {
-            client: super::get_http_client(),
+            client: super::get_google_api_client(),
         }
     }
 

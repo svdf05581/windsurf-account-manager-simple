@@ -33,6 +33,9 @@ export async function validateCardNumber(cardNumber: string): Promise<boolean> {
 
 /**
  * 获取试用支付链接（增强版）
+ *
+ * `accountId` 用于让后端按账号 ID 查库并构造完整的 AuthContext，
+ * 这样 Devin 账号也能正确附带 `x-devin-*` 扩展 header，避免"Devin 获取支付链接老是失败"。
  */
 export async function getTrialPaymentLink(
   accountName: string,
@@ -43,7 +46,8 @@ export async function getTrialPaymentLink(
   startTrial: boolean,
   teamName?: string,
   seatCount?: number,
-  turnstileToken?: string
+  turnstileToken?: string,
+  accountId?: string
 ): Promise<any> {
   return await invoke('get_trial_payment_link_enhanced', {
     accountName,
@@ -54,7 +58,8 @@ export async function getTrialPaymentLink(
     startTrial,
     teamName,
     seatCount,
-    turnstileToken
+    turnstileToken,
+    accountId
   });
 }
 

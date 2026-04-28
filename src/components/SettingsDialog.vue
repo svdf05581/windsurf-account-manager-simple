@@ -118,15 +118,19 @@
             <el-input
               v-model="settings.proxyUrl"
               placeholder="http://127.0.0.1:7890"
-              style="width: 280px;"
+              style="width: 320px;"
               clearable
             >
               <template #prefix>
                 <el-icon><Connection /></el-icon>
               </template>
             </el-input>
-            <div style="margin-top: 5px; color: #909399; font-size: 12px;">
-              支持 HTTP/HTTPS/SOCKS5 代理，格式：http://host:port 或 socks5://host:port
+            <div style="margin-top: 5px; color: #909399; font-size: 12px; line-height: 1.6;">
+              支持 HTTP/HTTPS/SOCKS5 代理，可用以下任意格式（不带协议时默认 http）：<br>
+              · <code>http://host:port</code> / <code>socks5://host:port</code><br>
+              · <code>host:port</code><br>
+              · <code>user:pass@host:port</code> / <code>host:port@user:pass</code><br>
+              · <code>host:port:user:pass</code> / <code>user:pass:host:port</code>
             </div>
           </el-form-item>
           
@@ -465,6 +469,22 @@
               :disabled="!windsurfPath"
             />
           </el-form-item>
+
+          <el-form-item label="加密注入模式（实验）">
+            <el-switch
+              v-model="settings.safeStorageInjectEnabled"
+              active-text="开启"
+              inactive-text="关闭"
+            />
+            <div style="margin-top: 5px; color: #909399; font-size: 12px; line-height: 1.5;">
+              开启后切号<strong>不再走 OAuth 回调</strong>：杀掉 Windsurf →
+              用 Electron safeStorage 同源加密把 apiKey 写入 state.vscdb →
+              重启 Windsurf。<br/>
+              优点：不会撞 "too many free user accounts for this device"。<br/>
+              限制：仅 Windows；Firebase 账号需先有 windsurf_api_key（刷新一次配额会自动拉取）；
+              Devin 账号开箱即用。
+            </div>
+          </el-form-item>
           
           <el-form-item label="补丁状态">
             <div class="patch-status-block">
@@ -726,6 +746,7 @@ const settings = reactive<{
   testModeEnabled: boolean;
   useLocalSuccessBins: boolean;
   seamlessSwitchEnabled: boolean;
+  safeStorageInjectEnabled: boolean;
   windsurfClientType: 'windsurf' | 'windsurf-next';
   windsurfPath: string | null;
   patchBackupPath: string | null;
@@ -763,6 +784,7 @@ const settings = reactive<{
   testModeEnabled: false,  // 默认关闭测试模式
   useLocalSuccessBins: false,  // 默认不使用本地BIN池
   seamlessSwitchEnabled: false,  // 默认关闭无感换号
+  safeStorageInjectEnabled: false,  // 默认关闭加密注入模式（实验功能）
   windsurfClientType: 'windsurf',  // 默认 Windsurf 客户端
   windsurfPath: null,  // Windsurf路径
   patchBackupPath: null,  // 补丁备份路径
