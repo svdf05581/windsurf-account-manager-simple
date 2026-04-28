@@ -136,6 +136,11 @@ pub struct Settings {
     pub team_name: String,  // Teams 计划的团队名称
     #[serde(default = "default_seat_count", rename = "seatCount")]
     pub seat_count: i32,  // Teams 计划的席位数量
+    /// **实验** 切号注入模式：true = 直接写加密的 state.vscdb（彻底跳过 OAuth deep link，
+    /// 不会触发 Windsurf 后端 "too many free user accounts" 计数）；
+    /// false = 走传统 OAuth 回调（需 Windsurf 在线）。仅 Windows 实现，默认关闭。
+    #[serde(default, rename = "safeStorageInjectEnabled")]
+    pub safe_storage_inject_enabled: bool,
 }
 
 fn default_browser_mode() -> String {
@@ -207,6 +212,7 @@ impl Default for Settings {
             start_trial: true,  // 默认开启试用
             team_name: String::new(),  // 默认空团队名称
             seat_count: 1,  // 默认1个席位
+            safe_storage_inject_enabled: false,  // 默认关闭加密注入模式（实验功能）
         }
     }
 }

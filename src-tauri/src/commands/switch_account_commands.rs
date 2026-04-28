@@ -304,6 +304,15 @@ pub async fn switch_account(
     id: String,
     data_store: State<'_, Arc<DataStore>>,
 ) -> Result<Value, String> {
+    // 设置开关：safe_storage_inject_enabled = true 时走加密注入路径
+    // （仅 Windows 实现，跳过 OAuth deep link，不会撞 too many free user accounts）
+    if let Ok(s) = data_store.get_settings().await {
+        if s.safe_storage_inject_enabled {
+            info!("Settings.safe_storage_inject_enabled = true, dispatching to inject path");
+            return switch_account_via_safe_storage(app, id, data_store).await;
+        }
+    }
+
     info!("Switching account: {}", id);
     emit_switch_progress(&app, "preparing", "开始切换账号...", 5, "running");
     
@@ -1072,4 +1081,287 @@ pub async fn check_admin_privileges() -> Result<bool, String> {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
+}
+
+// ============================================================================
+// 加密注入模式（safe_storage_inject）
+// ============================================================================
+//
+// 这条路径完全跳过 windsurf://...#access_token=... deep link，复刻 Electron
+// safeStorage 的同源加密把账号 apiKey 直接写进 state.vscdb：
+//
+//   1. 杀掉 Windsurf 进程（避免 SQLite/Local State 被锁）
+//   2. 重置 storage.json telemetry IDs + state.vscdb 的 codeium.installationId
+//      + 注册表 MachineGuid（reset_machine_id_internal kill=true 路径）
+//   3. 从 %APPDATA%\Windsurf\Local State 解 DPAPI 拿出 32 字节 master key
+//   4. 用 AES-256-GCM 加密两块密文并以 Buffer JSON 形式写入：
+//        - secret://{"extensionId":"codeium.windsurf","key":"windsurf_auth.sessions"}
+//        - secret://{"extensionId":"codeium.windsurf","key":"windsurf_auth.apiServerUrl"}
+//      同时把明文的 windsurfAuthStatus 和 codeium.windsurf 也一起写
+//   5. 调起 Windsurf（用户配置的 windsurf_path 或 auto-detect 的路径）
+//
+// 优点：完全不向 Windsurf 后端发 RegisterUser 请求 → 不会撞 too many free
+// 限制：必须先有该账号的 apiKey（Devin = devin-session-token，Firebase = windsurf_api_key）
+//       Windsurf safeStorage 加密格式如有变动需要适配
+// 参考：jlcodes99/cockpit-tools 的 windsurf_instance.rs
+
+const WINDSURF_AUTH_STATUS_KEY: &str = "windsurfAuthStatus";
+const WINDSURF_EXTENSION_STATE_KEY: &str = "codeium.windsurf";
+const WINDSURF_SESSIONS_SECRET_KEY: &str =
+    r#"secret://{"extensionId":"codeium.windsurf","key":"windsurf_auth.sessions"}"#;
+const WINDSURF_API_SERVER_SECRET_KEY: &str =
+    r#"secret://{"extensionId":"codeium.windsurf","key":"windsurf_auth.apiServerUrl"}"#;
+const WINDSURF_DEFAULT_API_SERVER_URL: &str = "https://server.codeium.com";
+
+/// 返回 Windsurf userData 根目录（包含 Local State / User/globalStorage 等）
+fn get_windsurf_data_root(client_type: &str) -> PathBuf {
+    let (_, data_dir_name) = get_client_uri_config(client_type);
+    let mut root = directories::BaseDirs::new()
+        .map(|dirs| dirs.data_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("C:/Users/Default/AppData/Roaming"));
+    root.push(data_dir_name);
+    root
+}
+
+/// 根据账号体系决定写进 sessions/windsurfAuthStatus 的 apiKey 字段。
+///
+/// - Devin 账号：`account.token` 自身就是 `devin-session-token$<JWT>`，可直接当 apiKey 用
+/// - Firebase 账号：用 GetCurrentUser 拿到的 `windsurf_api_key`（UUID 格式）
+fn resolve_inject_api_key(account: &crate::models::account::Account) -> AppResult<String> {
+    if account.is_devin_account() {
+        let token = account
+            .token
+            .clone()
+            .ok_or_else(|| AppError::ApiRequest(
+                "Devin 账号缺少 session-token，请先刷新登录".to_string()
+            ))?;
+        if token.is_empty() {
+            return Err(AppError::ApiRequest(
+                "Devin 账号 session-token 为空".to_string()
+            ));
+        }
+        Ok(token)
+    } else {
+        account
+            .windsurf_api_key
+            .clone()
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| AppError::ApiRequest(
+                "Firebase 账号缺少 windsurf_api_key（请先刷新一次账号信息以从 GetCurrentUser 拉取）".to_string()
+            ))
+    }
+}
+
+/// 把账号通过 Electron safeStorage 加密注入到 state.vscdb。
+///
+/// 此函数**会主动 taskkill** Windsurf 进程并写文件，调用方需保证调用前后做好提示。
+async fn inject_account_via_safe_storage(
+    client_type: &str,
+    account: &crate::models::account::Account,
+) -> AppResult<()> {
+    use crate::utils::electron_safe_storage::{encode_buffer_json, encrypt_v10, get_windows_master_key};
+
+    // 1) 解析 apiKey + 用户标识（用于 sessions.account.label / windsurfAuthStatus.name）
+    let api_key = resolve_inject_api_key(account)?;
+    let api_server_url = WINDSURF_DEFAULT_API_SERVER_URL.to_string();
+    let label = if !account.nickname.is_empty() {
+        account.nickname.clone()
+    } else {
+        account.email.clone()
+    };
+
+    // 2) 杀掉 Windsurf 进程（写 state.vscdb 必须独占文件）
+    let process_name = windsurf_process_name(client_type);
+    if is_windsurf_running(process_name) {
+        info!("Detected running {}, killing it before safe-storage injection", process_name);
+        kill_windsurf(process_name);
+    }
+
+    // 3) 同步重置 storage.json + codeium.installationId（reset_machine_id_internal kill=true 路径）
+    if let Err(e) = reset_machine_id_internal(client_type, true).await {
+        warn!("Reset machine ID failed during safe-storage inject: {:?}", e);
+        // 不阻断：注入本身和 reset 解耦，reset 失败仍可继续注入
+    }
+
+    // 4) 拼出 state.vscdb 路径
+    let data_root = get_windsurf_data_root(client_type);
+    let mut state_db_path = data_root.clone();
+    state_db_path.push("User");
+    state_db_path.push("globalStorage");
+    state_db_path.push("state.vscdb");
+    if !state_db_path.exists() {
+        return Err(AppError::FileOperation(format!(
+            "state.vscdb 不存在: {:?}\n请先启动一次 Windsurf 让它生成本地存储",
+            state_db_path
+        )));
+    }
+
+    // 5) 取出 Electron os_crypt master key
+    let master_key = get_windows_master_key(&data_root)?;
+
+    // 6) 构造并加密 sessions / apiServerUrl
+    let sessions_payload = json!([{
+        "id": Uuid::new_v4().to_string(),
+        "accessToken": api_key,
+        "account": {
+            "label": label,
+            "id": label,
+        },
+        "scopes": [],
+    }]);
+    let sessions_plain = sessions_payload.to_string();
+    let sessions_encrypted = encrypt_v10(&master_key, sessions_plain.as_bytes())?;
+    let sessions_buffer_json = encode_buffer_json(&sessions_encrypted);
+
+    let api_server_encrypted = encrypt_v10(&master_key, api_server_url.as_bytes())?;
+    let api_server_buffer_json = encode_buffer_json(&api_server_encrypted);
+
+    // 7) 构造明文 windsurfAuthStatus + codeium.windsurf
+    let auth_status_plain = json!({
+        "apiKey": api_key,
+        "name": label,
+        "email": account.email,
+        "apiServerUrl": api_server_url,
+    })
+    .to_string();
+
+    // 8) 一次事务写入四个 key
+    let conn = rusqlite::Connection::open(&state_db_path)
+        .map_err(|e| AppError::Database(format!("打开 state.vscdb 失败: {}", e)))?;
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(3));
+
+    let upsert_sql = "INSERT INTO ItemTable (key, value) VALUES (?1, ?2) \
+                      ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+
+    conn.execute(upsert_sql, (WINDSURF_AUTH_STATUS_KEY, &auth_status_plain))
+        .map_err(|e| AppError::Database(format!("写入 windsurfAuthStatus 失败: {}", e)))?;
+    conn.execute(upsert_sql, (WINDSURF_SESSIONS_SECRET_KEY, &sessions_buffer_json))
+        .map_err(|e| AppError::Database(format!("写入 windsurf_auth.sessions 失败: {}", e)))?;
+    conn.execute(upsert_sql, (WINDSURF_API_SERVER_SECRET_KEY, &api_server_buffer_json))
+        .map_err(|e| AppError::Database(format!("写入 windsurf_auth.apiServerUrl 失败: {}", e)))?;
+
+    // codeium.windsurf 是个明文 JSON，原本含 codeium.installationId（reset_machine_id 已经更新过），
+    // 这里把 apiServerUrl 也补上（cockpit-tools 的做法），让 Windsurf 启动时直接读到正确 server。
+    let existing_extension_state: Option<String> = conn
+        .query_row(
+            "SELECT value FROM ItemTable WHERE key = ?1",
+            [WINDSURF_EXTENSION_STATE_KEY],
+            |row| row.get(0),
+        )
+        .ok();
+    let mut extension_state: Value = existing_extension_state
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    if let Some(obj) = extension_state.as_object_mut() {
+        obj.insert("apiServerUrl".to_string(), Value::String(api_server_url.clone()));
+    }
+    let extension_state_str = extension_state.to_string();
+    conn.execute(upsert_sql, (WINDSURF_EXTENSION_STATE_KEY, &extension_state_str))
+        .map_err(|e| AppError::Database(format!("写入 codeium.windsurf 失败: {}", e)))?;
+
+    info!("Safe-storage inject 写入完成（4 keys）：path={:?}", state_db_path);
+    Ok(())
+}
+
+/// 写完 state.vscdb 后调起 Windsurf；找不到路径只 warn 不 abort。
+fn relaunch_windsurf(client_type: &str, configured_path: Option<&str>) {
+    let path = configured_path
+        .filter(|p| !p.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| detect_windsurf_path_internal(client_type).ok());
+    let Some(path) = path else {
+        warn!("找不到 Windsurf 安装路径，跳过自动启动；请手动启动 Windsurf 完成切号");
+        return;
+    };
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        let exe = format!("{}\\Windsurf.exe", path.trim_end_matches('\\'));
+        match Command::new(&exe)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+        {
+            Ok(_) => info!("Windsurf 已重新启动: {}", exe),
+            Err(e) => warn!("启动 Windsurf 失败: {} ({})", exe, e),
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+    }
+}
+
+/// 加密注入模式的一键换号
+///
+/// 与 `switch_account` 的 OAuth 路径并行存在；由 settings.safe_storage_inject_enabled 决定使用哪条
+#[tauri::command]
+pub async fn switch_account_via_safe_storage(
+    app: AppHandle,
+    id: String,
+    data_store: State<'_, Arc<DataStore>>,
+) -> Result<Value, String> {
+    info!("[Inject] Switching account via safe-storage: {}", id);
+    emit_switch_progress(&app, "preparing", "开始切换账号（加密注入模式）...", 5, "running");
+
+    let account_id = Uuid::parse_str(&id).map_err(|e| {
+        emit_switch_progress(&app, "preparing", format!("账号ID无效: {}", e), 5, "error");
+        e.to_string()
+    })?;
+
+    let account = data_store
+        .get_account(account_id)
+        .await
+        .map_err(|e| {
+            emit_switch_progress(&app, "preparing", format!("读取账号失败: {}", e), 5, "error");
+            e.to_string()
+        })?;
+
+    let settings = data_store.get_settings().await.map_err(|e| e.to_string())?;
+    let client_type = settings.windsurf_client_type.clone();
+
+    emit_switch_progress(&app, "fetch_access", "校验账号 apiKey...", 20, "running");
+    if let Err(e) = resolve_inject_api_key(&account) {
+        emit_switch_progress(&app, "fetch_access", format!("apiKey 不可用: {}", e), 20, "error");
+        return Ok(json!({
+            "success": false,
+            "error": e.to_string(),
+        }));
+    }
+
+    emit_switch_progress(&app, "reset_mid", "结束 Windsurf + 重置机器 ID + 加密注入...", 60, "running");
+    if let Err(e) = inject_account_via_safe_storage(&client_type, &account).await {
+        error!("[Inject] safe-storage inject 失败: {:?}", e);
+        emit_switch_progress(&app, "reset_mid", format!("加密注入失败: {}", e), 60, "error");
+        return Ok(json!({
+            "success": false,
+            "error": format!("加密注入失败: {}", e),
+        }));
+    }
+
+    emit_switch_progress(&app, "callback", "重新启动 Windsurf...", 88, "running");
+    relaunch_windsurf(&client_type, settings.windsurf_path.as_deref());
+
+    emit_switch_progress(&app, "finalize", "保存账号状态...", 96, "running");
+    if let Some(token) = account.token.clone() {
+        let expires_at = account
+            .token_expires_at
+            .unwrap_or_else(|| Utc::now() + chrono::Duration::days(30));
+        if let Err(e) = data_store
+            .update_account_token(account_id, token, expires_at)
+            .await
+        {
+            warn!("[Inject] update_account_token 失败（忽略）: {:?}", e);
+        }
+    }
+
+    emit_switch_progress(&app, "done", "切换完成", 100, "success");
+    Ok(json!({
+        "success": true,
+        "message": "已通过加密注入切换账号并重启 Windsurf（无需 OAuth 回调）",
+        "mode": "safe_storage_inject",
+    }))
 }

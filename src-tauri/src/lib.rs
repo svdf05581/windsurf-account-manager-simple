@@ -164,6 +164,7 @@ pub fn run() {
             
             // 切号相关命令
             commands::switch_account,
+            commands::switch_account_via_safe_storage,
             commands::reset_machine_id,
             commands::check_admin_privileges,
             
